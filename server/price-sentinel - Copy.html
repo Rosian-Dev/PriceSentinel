@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Price Sentinel</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo, useRef } = React;
+    const SERVER = "https://localhost:3001";
+    const ebayItemUrl   = id => "https://www.ebay.com/itm/" + id;
+    const ebayEditUrl   = id => "https://www.ebay.com/lstng?mode=ReviseItem&itemId=" + id + "&sr=wn";
+    const ebaySearchUrl = t  => "https://www.ebay.com/sch/i.html?_nkw=" + encodeURIComponent(t) + "&LH_BIN=1&_sop=15";
+    const fmt           = n  => Number(n).toFixed(2);
+    const D             = "$";
+
+    function PriceSentinel() {
+      const [items,            setItems]            = useState([]);
+      const [competitors,      setCompetitors]      = useState({});
+      const [apiStatus,        setApiStatus]        = useState("idle");
+      const [compStatus,       setCompStatus]       = useState("idle");
+      const [tab,              setTab]              = useState("dashboard");
+      const [search,           setSearch]           = useState("");
+      const [sort,             setSort]             = useState("price_desc");
+      const [compFilter,       setCompFilter]       = useState("all");
+      const [expanded,         setExpanded]         = useState(null);
+      const [copiedId,         setCopiedId]         = useState(null);
+      const [refreshingId,     setRefreshingId]     = useState(null);
+      const [repricingId,     setRepricingId]     = useState(null);
+      const [nextScanIn,      setNextScanIn]      = useState(90 * 60);
+      const [nextScanAt,      setNextScanAt]      = useState(null);
+      const itemsRef = useRef([]);
+      const [checkedMap,       setCheckedMap]       = useState({});
+      const [confirmedLowest,  setConfirmedLowest]  = useState(() => {
+        try { return JSON.parse(localStorage.getItem("sentinel:confirmed") || "{}"); } catch { return {}; }
+      });
+      const [storageLoaded,    setStorageLoaded]    = useState(false);
+      const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+      useEffect(() => {
+        try {
+          const saved = JSON.parse(localStorage.getItem("sentinel:state:v1") || "{}");
+          if (saved.checkedMap) setCheckedMap(saved.checkedMap);
+        } catch {}
+        setStorageLoaded(true);
+      }, []);
+
+      useEffect(() => {
+        if (!storageLoaded) return;
+        try { localStorage.setItem("sentinel:state:v1", JSON.stringify({ checkedMap })); } catch {}
+      }, [checkedMap, storageLoaded]);
+
+      function runScan(listings) {
+          setCompStatus("scanning");
+        fetch(SERVER + "/competitors/bulk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(listings),
+        })
+          .then(r => { if (!r.ok) throw new Error("fail"); return r.json(); })
+          .then(results => {
+            const map = {};
+            results.forEach(r => { map[r.itemId] = r; });
+            setCompetitors(map);
+            setCompStatus("done");
+          })
+          .catch(() => setCompStatus("error"));
+      }
+
+      // ── Poll server for scan status + countdown ──────────────────────────────
+      useEffect(() => {
+        if (!storageLoaded) return;
+        if ("Notification" in window && Notification.permission === "default") {
+          Notification.requestPermission();
+        }
+        // Poll server every 5 seconds for next scan time
+        const poll = setInterval(async () => {
+          try {
+            const r = await fetch(SERVER + "/scan-status");
+            const data = await r.json();
+            if (data.secondsUntilScan != null) setNextScanIn(data.secondsUntilScan);
+            if (data.nextScanTime) setNextScanAt(new Date(data.nextScanTime));
+            // If server just finished a scan (lastScanTime is recent), fetch new competitor data
+            if (data.lastScanTime) {
+              const age = Date.now() - data.lastScanTime;
+              if (age < 10000) { // within last 10 seconds = fresh scan
+                // reload competitors from cache
+                fetch(SERVER + "/competitors/bulk", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(itemsRef.current.map(l => ({ itemId: l.itemId, title: l.title, price: l.price }))),
+                })
+                  .then(r => r.json())
+                  .then(results => {
+                    const map = {};
+                    results.forEach(r => { map[r.itemId] = r; });
+                    setCompetitors(map);
+                    setCompStatus("done");
+                  });
+              }
+            }
+          } catch {}
+        }, 5000);
+        return () => clearInterval(poll);
+      }, [storageLoaded]);
+
+      // ── Send notification when scan completes and undercuts found ───────────
+      useEffect(() => {
+        if (compStatus !== "done") return;
+        const undercuts = Object.entries(competitors).filter(([id, c]) => {
+          const item = items.find(i => i.itemId === id);
+          const verified = confirmedLowest[id];
+          const verifiedPrice = verified?.lowestPrice ?? verified ?? null;
+          const newCompCheaper = c?.lowestPrice != null && verifiedPrice != null && c.lowestPrice < verifiedPrice;
+          return c && c.lowestPrice != null && item && item.price > c.lowestPrice && (!verified || newCompCheaper);
+        });
+        if (undercuts.length > 0 && "Notification" in window && Notification.permission === "granted") {
+          const names = undercuts.slice(0, 3).map(([id]) => {
+            const item = items.find(i => i.itemId === id);
+            return item ? item.title.split(" - ").pop() : id;
+          }).join(", ");
+          const more = undercuts.length > 3 ? " +" + (undercuts.length - 3) + " more" : "";
+          new Notification("Price Sentinel — " + undercuts.length + " UNDERCUT" + (undercuts.length > 1 ? "S" : ""), {
+            body: names + more,
+            icon: "https://www.ebay.com/favicon.ico",
+          });
+        }
+      }, [compStatus]);
+
+      useEffect(() => {
+        if (!storageLoaded) return;
+        setApiStatus("loading");
+        fetch(SERVER + "/listings")
+          .then(r => { if (!r.ok) throw new Error("fail"); return r.json(); })
+          .then(data => {
+            setItems(data.map(l => ({ ...l, price: Number(l.price), watchers: Number(l.watchers) || 0, qty: Number(l.qty) || 1 })));
+            setApiStatus("live");
+          })
+          .catch(() => setApiStatus("error"));
+      }, [storageLoaded]);
+
+      useEffect(() => { itemsRef.current = items; }, [items]);
+      const checkedItems = useMemo(() => items.filter(i => checkedMap[i.itemId]), [items, checkedMap]);
+
+      const filtered = useMemo(() => {
+        let list = items.filter(i => !checkedMap[i.itemId]);
+        if (search) {
+          const q = search.toLowerCase();
+          list = list.filter(i => i.title.toLowerCase().includes(q) || i.itemId.includes(q));
+        }
+        const getIsUndercut = i => !confirmedLowest[i.itemId] && competitors[i.itemId]?.lowestPrice != null && i.price > competitors[i.itemId].lowestPrice;
+        const getIsLowest   = i => confirmedLowest[i.itemId] || (competitors[i.itemId]?.lowestPrice != null && i.price <= competitors[i.itemId].lowestPrice);
+        const getIsNoComp   = i => !confirmedLowest[i.itemId] && competitors[i.itemId] && competitors[i.itemId].lowestPrice == null && !competitors[i.itemId].error;
+        if (compFilter === "undercut") list = list.filter(getIsUndercut);
+        if (compFilter === "lowest")   list = list.filter(getIsLowest);
+        if (compFilter === "nocomp")   list = list.filter(getIsNoComp);
+        if (compFilter === "verified") list = list.filter(i => confirmedLowest[i.itemId]);
+        if (sort === "price_desc") list.sort((a,b) => b.price - a.price);
+        if (sort === "price_asc")  list.sort((a,b) => a.price - b.price);
+        if (sort === "watchers")   list.sort((a,b) => b.watchers - a.watchers);
+        if (sort === "title")      list.sort((a,b) => a.title.localeCompare(b.title));
+        return list;
+      }, [items, search, compFilter, sort, checkedMap, competitors, confirmedLowest]);
+
+      function toggleChecked(e, itemId) {
+        e.stopPropagation();
+        setCheckedMap(prev => {
+          const next = { ...prev };
+          if (next[itemId]) delete next[itemId];
+          else next[itemId] = { checkedAt: Date.now() };
+          return next;
+        });
+      }
+
+      function toggleConfirmLowest(e, itemId, lowestPrice) {
+        e.stopPropagation();
+        setConfirmedLowest(prev => {
+          const next = { ...prev };
+          if (next[itemId]) delete next[itemId];
+          else next[itemId] = { ts: Date.now(), lowestPrice: lowestPrice ?? null };
+          try { localStorage.setItem("sentinel:confirmed", JSON.stringify(next)); } catch {}
+          return next;
+        });
+      }
+
+      function unverifyAll() {
+        setConfirmedLowest({});
+        try { localStorage.removeItem("sentinel:confirmed"); } catch {}
+      }
+
+      function resetAllChecked() {
+        setCheckedMap({});
+        setShowResetConfirm(false);
+      }
+
+      function copyToClipboard(title, itemId) {
+        navigator.clipboard?.writeText(title).catch(() => {});
+        setCopiedId(itemId);
+        setTimeout(() => setCopiedId(null), 1500);
+      }
+
+      async function repriceToCompetitor(e, item, compTotal) {
+        e.stopPropagation();
+        const newPrice = Math.max(0.01, compTotal - 0.01).toFixed(2);
+        setRepricingId(item.itemId);
+        try {
+          const r = await fetch(SERVER + "/listings/reprice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ itemId: item.itemId, newPrice }),
+          });
+          const data = await r.json();
+          if (data.success) {
+            setItems(prev => prev.map(i => i.itemId === item.itemId ? { ...i, price: parseFloat(newPrice) } : i));
+            setCompetitors(prev => ({
+              ...prev,
+              [item.itemId]: { ...prev[item.itemId], myPrice: parseFloat(newPrice), undercut: false }
+            }));
+          } else {
+            alert("Reprice failed: " + data.error);
+          }
+        } catch(err) {
+          alert("Reprice error: " + err.message);
+        }
+        setRepricingId(null);
+      }
+
+      async function refreshCompetitor(e, item) {
+        e.stopPropagation();
+        setRefreshingId(item.itemId);
+        try {
+          const r = await fetch(SERVER + "/competitors/refresh?itemId=" + item.itemId + "&title=" + encodeURIComponent(item.title) + "&price=" + item.price);
+          const data = await r.json();
+          setCompetitors(prev => ({ ...prev, [item.itemId]: data }));
+          // Update the item price if server fetched a newer one
+          if (data.myPrice && data.myPrice !== item.price) {
+            setItems(prev => prev.map(i => i.itemId === item.itemId ? { ...i, price: data.myPrice } : i));
+          }
+        } catch {}
+        setRefreshingId(null);
+      }
+
+      if (!storageLoaded) return (
+        <div style={{ minHeight:"100vh",background:"#08080f",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Courier New',monospace" }}>
+          <span style={{ color:"#00ff9d",letterSpacing:3,fontSize:11 }}>LOADING...</span>
+        </div>
+      );
+
+      const undercutCount = Object.entries(competitors).filter(([id, c]) => {
+        const item = items.find(i => i.itemId === id);
+        return c && c.lowestPrice != null && item && item.price > c.lowestPrice && !confirmedLowest[id];
+      }).length;
+      const noCompCount = Object.values(competitors).filter(c => c && c.lowestPrice == null && !c.error).length;
+
+      return (
+        <div style={{ minHeight:"100vh",background:"#08080f",fontFamily:"'Courier New',monospace",color:"#d0d0e0",fontSize:15 }}>
+          <style>{`
+            *{box-sizing:border-box;margin:0;padding:0}
+            ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#0d0d1a}::-webkit-scrollbar-thumb{background:#1e1e30}
+            @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+            @keyframes fi{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:translateY(0)}}
+            .row:hover{background:rgba(255,255,255,0.015)!important;cursor:pointer}
+            .tb{background:none;border:none;border-bottom:2px solid transparent;color:#444;font-family:'Courier New',monospace;font-size:13px;letter-spacing:2px;padding:14px 18px;cursor:pointer;text-transform:uppercase;transition:all 0.15s}
+            .tb.on{color:#00ff9d;border-bottom-color:#00ff9d}
+            .tb:hover{color:#888}
+            .lnk{color:#3a3a6a;font-size:10px;letter-spacing:1px;text-decoration:none;padding:4px 9px;border:1px solid #1e1e30;display:inline-flex;align-items:center;gap:4px;transition:all 0.15s;white-space:nowrap;cursor:pointer;background:none;font-family:'Courier New',monospace}
+            .lnk:hover{color:#8888cc;border-color:#3a3a5a;background:rgba(80,80,160,0.05)}
+            .lnk.grn:hover{color:#00ff9d;border-color:#1a5a30;background:rgba(0,255,100,0.04)}
+            .check-btn{background:none;border:1px solid #1a2a1a;color:#2a4a2a;width:26px;height:26px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:12px;transition:all 0.15s;border-radius:2px;font-family:'Courier New',monospace}
+            .check-btn:hover{border-color:#00ff9d;color:#00ff9d}
+            select,input{background:#0d0d1a;border:1px solid #1e1e30;color:#888;font-family:'Courier New',monospace;font-size:12px;padding:6px 10px;outline:none}
+            select:focus,input:focus{border-color:#3a3a5a;color:#bbb}
+          `}</style>
+
+          {/* Header */}
+          <div style={{ borderBottom:"1px solid #141422",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 28px",height:56 }}>
+            <div style={{ display:"flex",alignItems:"center",gap:14 }}>
+              <span style={{ color:"#00ff9d",letterSpacing:4,fontSize:14,fontWeight:700 }}>PRICE SENTINEL</span>
+              <span style={{ color:"#1a1a2a",fontSize:12 }}>·</span>
+              <span style={{ color:"#555",fontSize:12,letterSpacing:1 }}>rosianonbay</span>
+              <span style={{ width:7,height:7,borderRadius:"50%",background: apiStatus==="live" ? "#00ff9d" : apiStatus==="error" ? "#ff4444" : "#555",display:"inline-block",animation: apiStatus==="loading" ? "pulse 1s infinite" : "none" }}></span>
+            </div>
+            <div style={{ display:"flex",alignItems:"center",gap:16 }}>
+              {apiStatus === "loading" && <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#555",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#555",animation:"pulse 0.8s infinite",display:"inline-block" }}></span>SYNCING</div>}
+              {apiStatus === "live"    && <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#00ff9d",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#00ff9d",display:"inline-block" }}></span>LIVE</div>}
+              {apiStatus === "error"   && <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#ff4444",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#ff4444",display:"inline-block" }}></span>OFFLINE</div>}
+              {compStatus === "scanning" && <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#888",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#888",animation:"pulse 0.8s infinite",display:"inline-block" }}></span>SCANNING</div>}
+              {compStatus === "done" && (
+                <div style={{ display:"flex",alignItems:"center",gap:12 }}>
+                  <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#ff8c00",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#ff8c00",display:"inline-block" }}></span>{undercutCount} UNDERCUT</div>
+                  <div style={{ fontSize:11,color:"#555",letterSpacing:1 }}>{"o"} {noCompCount} NO COMP</div>
+                </div>
+              )}
+              {compStatus !== "scanning" && nextScanAt && (
+                <div style={{ fontSize:11,color:"#2a2a40",letterSpacing:1 }}>
+                  NEXT SCAN {nextScanAt.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})} ({String(Math.floor(nextScanIn/60)).padStart(2,"0")}:{String(nextScanIn%60).padStart(2,"0")})
+                </div>
+              )}
+              <div style={{ display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#1a3a1a",letterSpacing:1 }}><span style={{ width:6,height:6,borderRadius:"50%",background:"#00ff9d",opacity:0.4,display:"inline-block" }}></span>SAVED</div>
+            </div>
+          </div>
+
+          {/* Tabs row */}
+          <div style={{ borderBottom:"1px solid #141422",padding:"0 28px",display:"flex",alignItems:"center" }}>
+            <div style={{ display:"flex",flex:1 }}>
+              <button className={"tb" + (tab==="dashboard" ? " on" : "")} onClick={() => setTab("dashboard")}>
+                Dashboard {items.length > 0 && <span style={{ color:"#555",marginLeft:4 }}>({items.length})</span>}
+              </button>
+              <button className={"tb" + (tab==="checked" ? " on" : "")} onClick={() => setTab("checked")} style={{ position:"relative" }}>
+                Checked
+                {checkedItems.length > 0 && <span style={{ background:"#00ff9d",color:"#0a0a0f",fontSize:9,padding:"1px 6px",borderRadius:10,marginLeft:6,fontWeight:700 }}>{checkedItems.length}</span>}
+              </button>
+            </div>
+            <div style={{ display:"flex",alignItems:"center",gap:8 }}>
+              {compStatus !== "scanning" && (
+                <button onClick={() => runScan(items.map(l => ({ itemId:l.itemId, title:l.title, price:l.price })))}
+                  style={{ background:"none",border:"1px solid #222",color:"#666",fontFamily:"'Courier New',monospace",fontSize:11,letterSpacing:1,padding:"4px 12px",cursor:"pointer",borderRadius:2 }}>
+                  RESCAN
+                </button>
+              )}
+              {Object.keys(confirmedLowest).length > 0 && (
+                <button onClick={unverifyAll}
+                  style={{ background:"none",border:"1px solid #2a1a1a",color:"#8a4040",fontFamily:"'Courier New',monospace",fontSize:11,letterSpacing:1,padding:"4px 12px",cursor:"pointer",borderRadius:2 }}>
+                  UNVERIFY ALL
+                </button>
+              )}
+              {checkedItems.length > 0 && (
+                showResetConfirm ? (
+                  <div style={{ display:"flex",alignItems:"center",gap:8 }}>
+                    <span style={{ fontSize:10,color:"#666",letterSpacing:1 }}>RESET CHECKED?</span>
+                    <button onClick={resetAllChecked} style={{ background:"#ff4d6d",color:"#fff",border:"none",padding:"4px 10px",fontFamily:"'Courier New',monospace",fontSize:10,fontWeight:700,cursor:"pointer",letterSpacing:1 }}>YES</button>
+                    <button onClick={() => setShowResetConfirm(false)} style={{ background:"none",border:"1px solid #222",color:"#555",padding:"4px 10px",fontFamily:"'Courier New',monospace",fontSize:10,cursor:"pointer" }}>NO</button>
+                  </div>
+                ) : (
+                  <button onClick={() => setShowResetConfirm(true)} style={{ background:"none",border:"1px solid #222",color:"#555",fontFamily:"'Courier New',monospace",fontSize:11,letterSpacing:1,padding:"4px 12px",cursor:"pointer",borderRadius:2 }}>
+                    RESET CHECKED
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+
+          {/* Dashboard */}
+          {tab === "dashboard" && (
+            <div>
+              {/* Stats */}
+              <div style={{ display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,margin:"20px 28px" }}>
+                {[
+                  { v: items.length - checkedItems.length, l:"REMAINING",     c:"#d0d0e0" },
+                  { v: checkedItems.length,                 l:"CHECKED TODAY", c:"#00ff9d" },
+                ].map(s => (
+                  <div key={s.l} style={{ background:"#0d0d1a",border:"1px solid #141422",padding:"18px 22px",borderRadius:3 }}>
+                    <div style={{ fontSize:28,fontWeight:700,color:s.c,letterSpacing:-1 }}>{s.v}</div>
+                    <div style={{ fontSize:10,color:"#2a2a40",letterSpacing:3,marginTop:4 }}>{s.l}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Filters */}
+              <div style={{ display:"flex",gap:8,padding:"0 28px 14px",alignItems:"center" }}>
+                <input placeholder="Search title or item ID..." value={search} onChange={e => setSearch(e.target.value)} style={{ flex:1,minWidth:180 }} />
+                <select value={compFilter} onChange={e => setCompFilter(e.target.value)}>
+                  <option value="all">All</option>
+                  <option value="undercut">Undercut</option>
+                  <option value="lowest">Price Leader</option>
+                  <option value="nocomp">No Competitor</option>
+                  <option value="verified">Verified</option>
+                </select>
+                <select value={sort} onChange={e => setSort(e.target.value)}>
+                  <option value="price_desc">Price down</option>
+                  <option value="price_asc">Price up</option>
+                  <option value="watchers">Watchers</option>
+                  <option value="title">Title A-Z</option>
+                </select>
+              </div>
+
+              {/* Column headers */}
+              <div style={{ display:"grid",gridTemplateColumns:"1fr 100px 120px 120px 60px 48px 58px",gap:8,padding:"5px 14px",borderBottom:"1px solid #101020",marginBottom:1 }}>
+                {["TITLE","MY PRICE","COMPETITOR","STATUS","WATCH","QTY",""].map(h => (
+                  <div key={h} style={{ fontSize:10,color:"#2a2a40",letterSpacing:2 }}>{h}</div>
+                ))}
+              </div>
+
+              {/* Rows */}
+              <div style={{ maxHeight:"calc(100vh - 320px)",overflowY:"auto" }}>
+                {filtered.map(item => {
+                  const isExp      = expanded === item.itemId;
+                  const comp       = competitors[item.itemId];
+                  const verifiedEntry = confirmedLowest[item.itemId];
+                  const verifiedPrice = verifiedEntry?.lowestPrice ?? verifiedEntry ?? null;
+                  // Auto-unverify if a new cheaper competitor appeared since verification
+                  const newCompCheaper = comp?.lowestPrice != null && verifiedPrice != null && comp.lowestPrice < verifiedPrice;
+                  const isVerified = !!verifiedEntry && !newCompCheaper;
+                  const isUndercut = !isVerified && comp != null && comp.lowestPrice != null && item.price > comp.lowestPrice;
+                  const isLowest   = isVerified || (comp != null && comp.lowestPrice != null && item.price <= comp.lowestPrice);
+                  const compTotal  = (comp != null && comp.lowestPrice != null) ? comp.lowestPrice : null;
+                  const compBase   = (comp != null && comp.lowestItemPrice != null) ? comp.lowestItemPrice : null;
+                  const compShip   = (comp != null && comp.lowestShipping != null) ? comp.lowestShipping : 0;
+                  const hasNoComp  = comp != null && comp.lowestPrice == null && !comp.error;
+                  const scanning   = comp == null && compStatus === "scanning";
+
+                  return (
+                    <div key={item.itemId} style={{ animation:"fi 0.3s ease" }}>
+                      <div className="row" onClick={() => setExpanded(isExp ? null : item.itemId)}
+                        style={{ display:"grid",gridTemplateColumns:"1fr 100px 120px 120px 60px 48px 58px",gap:8,padding:"9px 14px",borderBottom:"1px solid #0d0d1a",alignItems:"start",background: isUndercut ? "rgba(255,40,40,0.04)" : "" }}>
+
+                        {/* Title */}
+                        <div>
+                          <div style={{ color: isUndercut ? "#ffaaaa" : "#bbbbd0",fontSize:14,wordBreak:"break-word" }}>{item.title}</div>
+                          <div style={{ fontSize:10,color:"#202038",marginTop:1 }}>{item.itemId}</div>
+                        </div>
+
+                        {/* My price */}
+                        <div style={{ paddingTop:2 }}>
+                          <div style={{ color: isUndercut ? "#ff4444" : "#d0d0e0",fontWeight:700,fontSize:15 }}>{D}{fmt(item.price)}</div>
+                        </div>
+
+                        {/* Competitor price */}
+                        <div style={{ paddingTop:2 }}>
+                          {compTotal != null ? (
+                            <div>
+                              <div style={{ fontWeight:700,fontSize:15,color: isUndercut ? "#ff4444" : "#44aa44" }}>
+                                {D}{fmt(compBase != null ? compBase : compTotal)}
+                              </div>
+                              {compShip > 0
+                                ? <div style={{ fontSize:10,color:"#555",marginTop:1 }}>+{D}{fmt(compShip)} ship</div>
+                                : compBase != null ? <div style={{ fontSize:10,color:"#2a5a2a",marginTop:1 }}>free ship</div>
+                                : null
+                              }
+                            </div>
+                          ) : hasNoComp ? (
+                            <div style={{ fontSize:11,color:"#2a2a4a" }}>no comp</div>
+                          ) : scanning ? (
+                            <div style={{ fontSize:11,color:"#2a2a2a" }}>...</div>
+                          ) : null}
+                        </div>
+
+                        {/* Status */}
+                        <div style={{ paddingTop:2 }}>
+                          {isVerified ? (
+                            <span style={{ fontSize:11,color:"#2a9a2a",background:"#0a2a0a",padding:"2px 8px",borderRadius:3,letterSpacing:1 }}>VERIFIED</span>
+                          ) : isUndercut ? (
+                            <span style={{ fontSize:11,color:"#ff4444",background:"rgba(255,40,40,0.1)",padding:"2px 8px",borderRadius:3,letterSpacing:1 }}>UNDERCUT</span>
+                          ) : isLowest ? (
+                            <span style={{ fontSize:11,color:"#2a8a2a",background:"rgba(0,200,80,0.06)",padding:"2px 8px",borderRadius:3,letterSpacing:1 }}>PRICE LEADER</span>
+                          ) : hasNoComp ? (
+                            <span style={{ fontSize:11,color:"#444",background:"#111128",padding:"2px 8px",borderRadius:3,letterSpacing:1 }}>NO COMP</span>
+                          ) : scanning ? (
+                            <span style={{ fontSize:11,color:"#2a2a2a" }}>...</span>
+                          ) : null}
+                        </div>
+
+                        {/* Watchers */}
+                        <div style={{ color:"#444",paddingTop:2 }}>
+                          {item.watchers > 0
+                            ? <span style={{ color: item.watchers > 5 ? "#ffd60a" : "#666" }}>{"👁"} {item.watchers}</span>
+                            : "—"}
+                        </div>
+
+                        {/* Qty */}
+                        <div style={{ color:"#333",paddingTop:2 }}>x{item.qty}</div>
+
+                        {/* Check button */}
+                        <div style={{ display:"flex",gap:4,justifyContent:"flex-end" }} onClick={e => e.stopPropagation()}>
+                          <button className="check-btn" title="Mark as checked" onClick={e => toggleChecked(e, item.itemId)}>✓</button>
+                        </div>
+                      </div>
+
+                      {/* Expanded panel */}
+                      {isExp && (
+                        <div style={{ background:"#0b0b16",borderBottom:"1px solid #141422",padding:"14px 26px 16px",animation:"fi 0.2s ease" }}>
+                          {comp && (
+                            <div style={{ display:"flex",gap:12,marginBottom:14,flexWrap:"wrap" }}>
+                              <div style={{ background:"#0f0f1e",border:"1px solid #1a1a30",borderRadius:4,padding:"10px 16px",minWidth:100 }}>
+                                <div style={{ fontSize:8,color:"#444",letterSpacing:2,marginBottom:4 }}>YOUR PRICE</div>
+                                <div style={{ fontSize:16,fontWeight:700,color:"#d0d0e0" }}>{D}{fmt(item.price)}</div>
+                              </div>
+                              {compTotal != null ? (
+                                <React.Fragment>
+                                  <div style={{ background:"#0f0f1e",border:"1px solid " + (isUndercut ? "#4a1a1a" : "#1a3a1a"),borderRadius:4,padding:"10px 16px",minWidth:100 }}>
+                                    <div style={{ fontSize:8,color:"#444",letterSpacing:2,marginBottom:4 }}>LOWEST COMP</div>
+                                    <div style={{ fontSize:16,fontWeight:700,color: isUndercut ? "#ff4444" : "#44aa44" }}>
+                                      {D}{fmt(compBase != null ? compBase : compTotal)}
+                                      {compShip > 0 && <span style={{ fontSize:11,fontWeight:400,color:"#666" }}> + {D}{fmt(compShip)}</span>}
+                                      {compShip === 0 && compBase != null && <span style={{ fontSize:9,fontWeight:400,color:"#2a5a2a" }}> FREE</span>}
+                                    </div>
+                                    {compShip > 0 && <div style={{ fontSize:8,color:"#444",marginTop:1 }}>= {D}{fmt(compTotal)} total</div>}
+                                    {comp.lowestSeller && <div style={{ fontSize:8,color:"#333",marginTop:3 }}>{comp.lowestSeller}</div>}
+                                  </div>
+                                  <div style={{ background:"#0f0f1e",border:"1px solid #1a1a30",borderRadius:4,padding:"10px 16px",minWidth:100 }}>
+                                    <div style={{ fontSize:8,color:"#444",letterSpacing:2,marginBottom:4 }}>DIFFERENCE</div>
+                                    <div style={{ fontSize:16,fontWeight:700,color: isUndercut ? "#ff4444" : "#44aa44" }}>
+                                      {isUndercut
+                                        ? "+" + D + fmt(item.price - compTotal)
+                                        : "-" + D + fmt(compTotal - item.price)
+                                      }
+                                    </div>
+                                    <div style={{ fontSize:8,color:"#333",marginTop:3 }}>{isUndercut ? "YOU'RE HIGHER" : "YOU'RE LOWER"}</div>
+                                  </div>
+                                  {comp.lowestItemId && (
+                                    <div style={{ display:"flex",alignItems:"center" }}>
+                                      <a href={ebayItemUrl(comp.lowestItemId)} target="_blank" rel="noopener noreferrer" className="lnk" style={{ fontSize:10 }} onClick={e => e.stopPropagation()}>
+                                        VIEW COMPETITOR
+                                      </a>
+                                    </div>
+                                  )}
+                                </React.Fragment>
+                              ) : (
+                                <div style={{ background:"#0f0f1e",border:"1px solid #1a1a30",borderRadius:4,padding:"10px 16px" }}>
+                                  <div style={{ fontSize:8,color:"#333",letterSpacing:2 }}>NO COMPETITORS FOUND</div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          <div style={{ display:"flex",gap:8,flexWrap:"wrap",alignItems:"center" }}>
+                            <a href={ebaySearchUrl(item.title)} target="_blank" rel="noopener noreferrer" className="lnk">SEARCH EBAY</a>
+                            <a href={ebayItemUrl(item.itemId)} target="_blank" rel="noopener noreferrer" className="lnk grn">YOUR LISTING</a>
+                            <a href={ebayEditUrl(item.itemId)} target="_blank" rel="noopener noreferrer" className="lnk grn">EDIT LISTING</a>
+                            <button className="lnk" onClick={e => { e.stopPropagation(); copyToClipboard(item.title, item.itemId); }}>
+                              {copiedId === item.itemId ? "COPIED" : "COPY TITLE"}
+                            </button>
+                            <button className="lnk" onClick={e => refreshCompetitor(e, item)} disabled={refreshingId === item.itemId} style={{ opacity: refreshingId === item.itemId ? 0.5 : 1 }}>
+                              {refreshingId === item.itemId ? "CHECKING..." : "REFRESH PRICE"}
+                            </button>
+                            {isUndercut && compTotal != null && (
+                              <button className="lnk" onClick={e => repriceToCompetitor(e, item, compTotal)}
+                                disabled={repricingId === item.itemId}
+                                style={{ opacity: repricingId === item.itemId ? 0.5 : 1, borderColor:"#4a1a1a",color:"#ff6666" }}>
+                                {repricingId === item.itemId ? "REPRICING..." : "MATCH -1c ($" + (Math.max(0.01, compTotal - 0.01)).toFixed(2) + ")"}
+                              </button>
+                            )}
+                            <button className="lnk" onClick={e => toggleConfirmLowest(e, item.itemId, compTotal)}
+                              style={{ borderColor: isVerified ? "#1a6a1a" : "", color: isVerified ? "#2a9a2a" : "" }}>
+                              {isVerified ? "VERIFIED - CLICK TO UNVERIFY" : isUndercut ? "OVERRIDE - MARK AS LOWEST" : "VERIFY LOWEST PRICE"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Checked tab */}
+          {tab === "checked" && (
+            <div style={{ padding:"20px 28px" }}>
+              {checkedItems.length === 0 ? (
+                <div style={{ textAlign:"center",padding:"80px 0",color:"#1a1a2a" }}>
+                  <div style={{ fontSize:30,marginBottom:12 }}>✓</div>
+                  <div style={{ fontSize:10,letterSpacing:3 }}>NOTHING CHECKED YET</div>
+                </div>
+              ) : (
+                <div>
+                  <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14 }}>
+                    <div style={{ fontSize:10,color:"#2a4a2a",letterSpacing:2 }}>{checkedItems.length} / {items.length} CHECKED</div>
+                    <div style={{ flex:1,margin:"0 20px",height:3,background:"#111",borderRadius:2 }}>
+                      <div style={{ height:3,background:"#00ff9d",borderRadius:2,width: Math.round(checkedItems.length/Math.max(items.length,1)*100) + "%",transition:"width 0.3s" }}></div>
+                    </div>
+                  </div>
+                  <div style={{ display:"grid",gridTemplateColumns:"1fr 82px 80px 60px",gap:8,padding:"5px 14px",borderBottom:"1px solid #101020",marginBottom:1 }}>
+                    {["TITLE","PRICE","CHECKED AT",""].map(h => (
+                      <div key={h} style={{ fontSize:9,color:"#2a2a40",letterSpacing:2 }}>{h}</div>
+                    ))}
+                  </div>
+                  <div>
+                    {checkedItems.map(item => (
+                      <div key={item.itemId} style={{ display:"grid",gridTemplateColumns:"1fr 82px 80px 60px",gap:8,padding:"8px 14px",borderBottom:"1px solid #0a0a12",alignItems:"start",opacity:0.7 }}>
+                        <div>
+                          <div style={{ color:"#888",fontSize:12,textDecoration:"line-through",textDecorationColor:"#2a2a2a",wordBreak:"break-word" }}>{item.title}</div>
+                          <div style={{ fontSize:9,color:"#1a1a28",marginTop:1 }}>{item.itemId}</div>
+                        </div>
+                        <div style={{ color:"#666",fontWeight:700,paddingTop:2 }}>{D}{fmt(item.price)}</div>
+                        <div style={{ fontSize:9,color:"#2a3a2a",letterSpacing:0.5,paddingTop:3 }}>
+                          {checkedMap[item.itemId]?.checkedAt ? new Date(checkedMap[item.itemId].checkedAt).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) : "—"}
+                        </div>
+                        <div style={{ display:"flex",justifyContent:"flex-end" }}>
+                          <button title="Uncheck" onClick={e => toggleChecked(e, item.itemId)}
+                            style={{ background:"none",border:"1px solid #1a2a1a",color:"#2a4a2a",width:24,height:24,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:11,transition:"all 0.15s",borderRadius:2 }}
+                            onMouseOver={e => { e.currentTarget.style.borderColor="#ff4d6d"; e.currentTarget.style.color="#ff4d6d"; }}
+                            onMouseOut={e => { e.currentTarget.style.borderColor="#1a2a1a"; e.currentTarget.style.color="#2a4a2a"; }}>
+                            x
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div style={{ marginTop:20,paddingTop:12,borderTop:"1px solid #0d0d1a",padding:"12px 28px" }}>
+            <div style={{ fontSize:9,color:"#181828",letterSpacing:1 }}>PRICE SENTINEL · rosianonbay</div>
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<PriceSentinel />);
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>

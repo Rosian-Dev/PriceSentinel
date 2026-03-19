@@ -1,0 +1,27 @@
+# === Claude Code / AI assistant artifacts ===
+.claude/
+CLAUDE.md
+.ai/
+.mcp.json
+.cursor/
+.cursorrules
+
+# === Dependencies ===
+node_modules/
+
+# === Binaries / executables ===
+*.exe
+ngrok.exe
+
+# === Secrets ===
+server/tokens.json
+tokens.json
+
+# === Logs & env ===
+*.log
+.env
+.env.*
+
+# === OS noise ===
+.DS_Store
+Thumbs.db
